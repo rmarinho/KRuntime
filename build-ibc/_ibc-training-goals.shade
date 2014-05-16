@@ -1,0 +1,230 @@
+@{/*
+    The goals for build IBC trained KRE
+*/}
+use assembly="System.Xml.Linq, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+use assembly="System.IO.Compression.FileSystem, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+use namespace="System"
+use namespace="System.IO"
+use namespace="System.Text"
+use namespace="System.Diagnostics"
+
+var BASE_DIR='${Directory.GetCurrentDirectory()}'
+var PERF_TEST_DROP=''
+var RAW_BUILD_DIR='${Path.Combine(BASE_DIR, "artifacts", "build")}'
+var WORKSPACE_DIR='${Path.Combine(BASE_DIR, "workspace")}'
+var LOCAL_KRE_HOME_DIR='${Path.Combine(BASE_DIR, "workspace", "kre_home")}'
+var PERF_DIR='${Path.Combine(BASE_DIR, "workspace", "perf")}'
+var PERF_SAMPLE_DIR='${Path.Combine(BASE_DIR, "workspace", "perf", "apps", "webfx", "HelloMvc")}'
+var LATEST_PERF_DROP='${@"\\bpdfiles01\CommonShare\trdai\Performance\Drops"}'
+var IBC_OUTPUT_DIR='${Path.Combine(WORKSPACE_DIR, "IBC")}'
+
+var nupkgPaths = '${new string[] {
+    Files.Include(Path.Combine(RAW_BUILD_DIR, "KRE-svr50-x86.*.nupkg")).Single(),
+    Files.Include(Path.Combine(RAW_BUILD_DIR, "KRE-svr50-x64.*.nupkg")).Single(),
+    Files.Include(Path.Combine(RAW_BUILD_DIR, "KRE-svrc50-x86.*.nupkg")).Single(),
+    Files.Include(Path.Combine(RAW_BUILD_DIR, "KRE-svrc50-x64.*.nupkg")).Single(),
+}}'
+
+var rawPackageVersion=''
+var corex86bin=''
+var corex64bin=''
+var net45x86bin=''
+var net45x64bin=''
+
+var BBSWEEP_PATH='${Environment.GetEnvironmentVariable("BBSWEEP_PATH")}'
+var IBCMERGE_PATH='${Environment.GetEnvironmentVariable("IBCMERGE_PATH")}'
+var PFUTIL_PATH='${Environment.GetEnvironmentVariable("PFUTIL_PATH")}'
+
+var IISEXPRESS_PATH = '${Path.Combine(Environment.GetEnvironmentVariable("ProgramFiles(x86)"), "IIS Express", "iisexpress.exe")}'
+
+#build-ibc .ibc-initialize .ibc-tuned-module .ibc-collect-data .ibc-tune-kre .ibc-package
+
+#ibc-validate
+    test if='!Directory.Exists(RAW_BUILD_DIR)'
+        log warn='${RAW_BUILD_DIR} doesn`t exist'
+    test if='BBSWEEP_PATH==null'
+        @{ throw new InvalidOperationException("Environment variable BBSWEEP_PATH doesn`t exist."); }
+    test if='!File.Exists(BBSWEEP_PATH)'
+        @{ throw new InvalidOperationException("Environment variable BBSWEEP_PATH points a file doesn`t exist."); }
+    test if='IBCMERGE_PATH==null'
+        @{ throw new InvalidOperationException("Environment variable IBCMERGE_PATH doesn`t exist."); }
+    test if='!File.Exists(IBCMERGE_PATH)'
+        @{ throw new InvalidOperationException("Environment variable IBCMERGE_PATH points a file doesn`t exist."); }
+    test if='PFUTIL_PATH==null'
+        @{ throw new InvalidOperationException("Environment variable PFUTIL_PATH doesn`t exist."); }
+    test if='!File.Exists(PFUTIL_PATH)'
+        @{ throw new InvalidOperationException("Environment variable PFUTIL_PATH points a file doesn`t exist."); }
+
+#ibc-initialize .ibc-validate
+    directory delete='${WORKSPACE_DIR}'
+    directory create='${WORKSPACE_DIR}'
+    directory create='${LOCAL_KRE_HOME_DIR}'
+    copy sourceDir='${LATEST_PERF_DROP}' outputDir='${PERF_DIR}'
+    @{
+        Environment.SetEnvironmentVariable("KRE_HOME", LOCAL_KRE_HOME_DIR);
+    }
+    for each='var nupkgPath in nupkgPaths'
+        @{
+            var kreName = Path.GetFileNameWithoutExtension(nupkgPath);
+            var krePath = Path.Combine(LOCAL_KRE_HOME_DIR, "packages", kreName);
+
+            Log.Info("Unpacking " + nupkgPath); 
+            if (Directory.Exists(krePath)) {
+                Directory.Delete(krePath, recursive:true); 
+            }
+
+            Directory.CreateDirectory(krePath);
+            System.IO.Compression.ZipFile.ExtractToDirectory(nupkgPath, krePath);
+            rawPackageVersion = kreName.Substring(kreName.IndexOf(".") + 1);
+
+            if (krePath.Contains("x86")) {
+                if (krePath.Contains("svrc")) {
+                    corex86bin = Path.Combine(krePath, "bin");
+                }
+                else {
+                    net45x86bin = Path.Combine(krePath, "bin");
+                }
+            }
+            else {
+                if (krePath.Contains("svrc")) {
+                    corex64bin = Path.Combine(krePath, "bin");
+                }
+                else {
+                    net45x64bin = Path.Combine(krePath, "bin");
+                }
+            }
+        }
+    log info='${"KRE HOME is: " + Environment.GetEnvironmentVariable("KRE_HOME")}'
+    log info='${string.Format("{0}\n{1}\n{2}\n{3}", corex64bin, corex86bin, net45x64bin, net45x86bin)}'
+
+#ibc-tuned-module
+    @{/* x86 only for now */}
+    exec program='${Path.Combine(net45x86bin, "kpm.cmd")}' commandline='restore' workingdir='${PERF_SAMPLE_DIR}'
+    var aspnetLoader = '${Directory.GetFiles("packages", "AspNet.Loader.Dll", SearchOption.AllDirectories).FirstOrDefault()}'
+    log info="Copy ASPNET.Loader.Dll ${aspnetLoader}"
+    copy sourceDir='${Path.GetDirectoryName(aspnetLoader)}' outputDir='${Path.Combine(PERF_SAMPLE_DIR, "src", "Application", "bin")}' include='${Path.GetFileName(aspnetLoader)}'
+    log info="Update version in k.ini to ${rawPackageVersion}"
+    @{
+        var kini = Directory.GetFiles(PERF_SAMPLE_DIR, "k.ini", SearchOption.AllDirectories).FirstOrDefault();
+        var lines = File.ReadAllLines(kini);
+        for (int i =0; i < lines.Length; ++i) {
+            if (lines[i].Contains("KRE_VERSION")) {
+                lines[i] = string.Format("KRE_VERSION={0}", rawPackageVersion);
+            }
+        }
+        File.WriteAllLines(kini, lines);
+    }
+    exec program='${Path.Combine(corex86bin, "k.cmd")}' commandline='crossgen' workingdir='${PERF_SAMPLE_DIR}'
+    exec program='${Path.Combine(corex86bin, "crossgen.exe")}' commandline='/nologo /out ${Path.Combine(corex86bin, "mscorlib.ni.dll")} /tuning ${Path.Combine(corex64bin, "mscorlib.dll")}'
+    log info='Generating tuned image for KLR'
+    var tuneModuleBuilder='${new StringBuilder("mscorlib")}'
+    for each='var imagePath in Directory.GetFiles(corex86bin, "*.ni.dll")'
+        log info='Image Path ${imagePath}'
+        var imageFileName = '${Path.GetFileName(imagePath)}'
+        var moduleName = '${imageFileName.Substring(0, imageFileName.Length - 7)}'
+        @{ 
+            tuneModuleBuilder.Append(" " + moduleName); 
+            var args = string.Format(
+                "/nologo /MissingDependenciesOK /out {0} /tuning /platform_assemblies_paths {1} {2}", 
+                imagePath,
+                corex86bin, 
+                Path.Combine(corex86bin, moduleName+".dll"));
+        }
+        log info='Running crossgen ${args}'
+        exec program='${Path.Combine(corex86bin, "crossgen.exe")}' commandline='${args}'
+    @{
+        Directory.CreateDirectory(IBC_OUTPUT_DIR);
+        Environment.SetEnvironmentVariable("COMPLUS_BBSweep", "1"); 
+        Environment.SetEnvironmentVariable("COMPLUS_ZapBBInstrDir", IBC_OUTPUT_DIR);
+        Environment.SetEnvironmentVariable("COMPLUS_ZapBBInstr", tuneModuleBuilder.ToString());
+
+        // for some reason crossgen.exe does not exit sometimes so I cannot wait on it, sleep a little 
+        System.Threading.Thread.Sleep(30000);
+    }
+    log info="Modules to be tuned: ${Environment.GetEnvironmentVariable("COMPLUS_ZapBBInstr")}"
+    log info="IBC counts would be saved in: ${Environment.GetEnvironmentVariable("COMPLUS_ZapBBInstrDir")}"
+
+#ibc-collect-data
+    @{/* x86 only for now */}
+    log info='Sweeping OS cache ...'
+    exec program='${PFUTIL_PATH}' commandline='-purge'
+    log info='Collect IBC data by running HelloMvc sample'
+    @{
+        var iisProcInfo = new ProcessStartInfo(IISEXPRESS_PATH, string.Format("/port:8080 /path:{0}", Path.Combine(PERF_SAMPLE_DIR, "src", "Application")));
+        var iisProc = Process.Start(iisProcInfo);
+    }
+    exec program='powershell' commandline='curl http://localhost:8080'
+    log info="Sweeping IBC counts ..."
+    exec program='${BBSWEEP_PATH}' commandline='-sweep iisexpress.exe'
+    log info="Killing IIS ..."
+    @{
+        iisProc.Kill();
+        iisProc.WaitForExit();
+    }
+    log info='Finished collecting IBC data'
+
+#ibc-tune-kre
+    @{/* x86 only for now */}
+    log info='Tune KRE with IBC data'
+    var thisKrePath='${corex86bin}'
+    var ibcDataLocation='${Environment.GetEnvironmentVariable("COMPLUS_ZapBBInstrDir")}'
+    for each='var ibcFile in Directory.GetFiles(ibcDataLocation)'
+        @{
+            var moduleName = Path.GetFileName(ibcFile); 
+            moduleName = moduleName.Substring(0, moduleName.Length -4); // strip out .ibc 
+            if (moduleName.EndsWith(".ni")) { 
+                 // strip out .ni if present
+                moduleName = moduleName.Substring(0, moduleName.Length - 3);
+            }
+            var niLocation = Path.Combine(thisKrePath, moduleName + ".dll"); 
+            var args = string.Format("-f -delete -mo {0} -minify {1}", niLocation, ibcFile);
+            Log.Info("Running IBCMerge " + args); 
+            var procInfo = new ProcessStartInfo(IBCMERGE_PATH, args);
+            procInfo.RedirectStandardError = true; 
+            procInfo.RedirectStandardOutput = true; 
+            procInfo.UseShellExecute = false; 
+
+            var proc = Process.Start(procInfo); 
+            proc.WaitForExit();
+            Log.Info(string.Format("Exit code: {0}", proc.ExitCode));
+        }
+
+#ibc-package
+    @{/* x86 only for now */}
+    var artifactsDir='${Path.Combine(RAW_BUILD_DIR, "KRE-IBC")}'
+    directory delete='${artifactsDir}'
+    directory create='${artifactsDir}'
+    var kreVersionName='${Directory.GetParent(corex86bin).Name}'
+    var ibcKreName='${kreVersionName.Insert(kreVersionName.IndexOf("."), "-ibc")}'
+    
+    log info='Creating IBC tuned Kre: ${ibcKreName}'
+    copy sourceDir='${corex86bin}' outputDir='${Path.Combine(artifactsDir, 'bin')}' -exclude='*.ni.dll'
+    exec program='.\.nuget\nuget' commandline='SetApiKey ${ibcKreName}'
+    var packageName='${ibcKreName.Substring(0, ibcKreName.IndexOf("."))}'
+    var nuspecPath='${Path.Combine(artifactsDir, packageName + ".nuspec")}'
+    @{
+        var nuspecTemplate=
+@"<?xml version=""1.0""?>
+<package xmlns=""http://schemas.microsoft.com/packaging/2011/10/nuspec.xsd"">
+  <metadata>
+    <id>{0}</id>
+    <version>{1}</version>
+    <authors>Microsoft</authors>
+    <owners>Microsoft</owners>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>IBC tuned K Runtime Environment for CoreCLR x86 using HelloMvc usecase</description>
+  </metadata>
+</package>";
+        var version = ibcKreName.Substring(ibcKreName.IndexOf(".") + 1);
+        var nuspecString = string.Format(nuspecTemplate, packageName, version);
+        File.WriteAllText(nuspecPath, nuspecString);
+
+        // move the ibc directory to artifacts
+        var ibcDir = Environment.GetEnvironmentVariable("COMPLUS_ZapBBInstrDir");
+        var ibcArtifactsDir = Path.Combine(artifactsDir, ".ibc");
+        if (Directory.Exists(ibcArtifactsDir)) {
+            Directory.Delete(ibcArtifactsDir, true); 
+        } 
+    } 
+    copy sourceDir='${ibcDir}' outputDir='${ibcArtifactsDir}'
+    nuget-pack nuspecFile='${nuspecPath}' packageVersion='${version}' outputDir='${RAW_BUILD_DIR}' extra='-NoPackageAnalysis'
